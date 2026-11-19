@@ -12,6 +12,7 @@ import mmap
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -22,6 +23,7 @@ HIGH_FLOOR_PERCENT = 50
 MAX_INITIAL_SCAN_BYTES = 4 * 1024 * 1024
 TOP_COMPACT_MARKERS = (b'"type":"compacted"', b'"type": "compacted"')
 ITEM_COMPACT_MARKERS = (b'"type":"compaction"', b'"type": "compaction"')
+EVENT_SCHEMA_VERSION = 1
 
 
 def _seek_to_record(stream, start):
@@ -215,7 +217,30 @@ def _write_state(directory, path, state):
     path.chmod(0o600)
 
 
+def _append_event(directory, event):
+    """Append one privacy-safe event without making the hook blocking."""
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory.chmod(0o700)
+        timestamp = datetime.now(timezone.utc)
+        path = directory / f"events-{timestamp:%Y-%m}.jsonl"
+        payload = dict(event)
+        payload.setdefault("schema_version", EVENT_SCHEMA_VERSION)
+        payload.setdefault("timestamp", timestamp.isoformat())
+        line = (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+            os.write(descriptor, line)
+        finally:
+            os.close(descriptor)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def main():
+    started = time.monotonic()
     try:
         event = json.load(sys.stdin)
         if not isinstance(event, dict) or event.get("hook_event_name") not in (
@@ -227,8 +252,10 @@ def main():
         if not session_id:
             return
 
-        state_dir = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "context-nudge-state"
-        state_path = state_dir / (hashlib.sha256(session_id.encode()).hexdigest() + ".json")
+        codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        state_dir = codex_home / "context-nudge-state"
+        session_hash = hashlib.sha256(session_id.encode()).hexdigest()
+        state_path = state_dir / (session_hash + ".json")
         state = _load_state(state_path)
 
         if event.get("hook_event_name") == "SessionStart":
@@ -246,7 +273,9 @@ def main():
                 stats = transcript_stats(transcript_path, state)
 
         state = stats["state"]
-        compacts = max(stats["compacts"], int(state.get("event_compacts", 0) or 0))
+        transcript_compacts = stats["compacts"]
+        event_compacts = int(state.get("event_compacts", 0) or 0)
+        compacts = max(transcript_compacts, event_compacts)
         floor = stats["floor"]
         current = stats["current"]
         window = stats["window"]
@@ -268,6 +297,7 @@ def main():
         reminded = int(state.get("reminded_level", 0) or 0)
         if level <= reminded:
             return
+        previous_reminded_level = reminded
         state["reminded_level"] = level
         state["last_reminder_at"] = int(time.time())
         _write_state(state_dir, state_path, state)
@@ -278,6 +308,32 @@ def main():
         urgency = "建议在合适节点" if level == 1 else "建议完成当前这一小步后尽快"
         reminder = f"[context-nudge] {facts}。先完成用户当前请求，在回答末尾用一句话{urgency}生成交接摘要并开新对话；不要打断当前任务或单独回复。"
         notice = f"Context 已压缩 {compacts} 次，可考虑交接到新对话。"
+        reasons = []
+        if compacts >= (HIGH_COMPACTS if level == 2 else MID_COMPACTS):
+            reasons.append("compact_count")
+        if floor_percent >= (HIGH_FLOOR_PERCENT if level == 2 else MID_FLOOR_PERCENT):
+            reasons.append("floor_percent")
+        _append_event(
+            codex_home / "context-nudge-logs",
+            {
+                "event": "reminder_emitted",
+                "session_hash": session_hash,
+                "level": level,
+                "reason": reasons,
+                "compact_count": compacts,
+                "event_compact_count": event_compacts,
+                "transcript_compact_count": transcript_compacts,
+                "floor_tokens": floor,
+                "floor_percent": floor_percent if floor is not None and window else None,
+                "current_tokens": current,
+                "current_percent": current_percent if current is not None and window else None,
+                "context_window": window,
+                "previous_reminded_level": previous_reminded_level,
+                "system_message_emitted": True,
+                "additional_context_emitted": True,
+                "hook_duration_ms": round((time.monotonic() - started) * 1000, 3),
+            },
+        )
         print(
             json.dumps(
                 {

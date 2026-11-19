@@ -94,6 +94,22 @@ class ContextNudgeTests(unittest.TestCase):
             self.assertIn("additionalContext", result["hookSpecificOutput"])
             self.assertIn("压缩后基线占窗口 7%", result["hookSpecificOutput"]["additionalContext"])
 
+            log_files = list((tmp_path / "codex" / "context-nudge-logs").glob("events-*.jsonl"))
+            self.assertEqual(len(log_files), 1)
+            event_log = json.loads(log_files[0].read_text())
+            self.assertEqual(event_log["schema_version"], 1)
+            self.assertEqual(event_log["event"], "reminder_emitted")
+            self.assertEqual(event_log["session_hash"], MODULE.hashlib.sha256(b"test-session").hexdigest())
+            self.assertEqual(event_log["level"], 1)
+            self.assertEqual(event_log["reason"], ["compact_count"])
+            self.assertEqual(event_log["transcript_compact_count"], 2)
+            self.assertEqual(event_log["floor_tokens"], 20000)
+            self.assertEqual(event_log["floor_percent"], 7)
+            self.assertTrue(event_log["system_message_emitted"])
+            self.assertTrue(event_log["additional_context_emitted"])
+            self.assertEqual(log_files[0].stat().st_mode & 0o777, 0o600)
+            self.assertEqual(log_files[0].parent.stat().st_mode & 0o777, 0o700)
+
     def test_initial_scan_counts_compacts_before_tail(self):
         with tempfile.TemporaryDirectory() as tmp:
             transcript = Path(tmp) / "session.jsonl"
