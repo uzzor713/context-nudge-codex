@@ -28,6 +28,8 @@ chmod +x ~/.codex/hooks/context-nudge.py
 
 每次用户提交消息时会向 `~/.codex/context-nudge-logs/events-YYYY-MM.jsonl` 追加一条 `evaluation`，记录提醒是触发还是被抑制及其原因；实际触发时另写一条 `reminder_emitted`。日志包括哈希后的 session 标识、触发原因、compact 计数、压缩后基线、当前用量和输出目标，不保存 prompt、回复正文、tool 输出或 transcript 路径。目录权限为 `0700`，日志文件权限为 `0600`。
 
+每次 hook 调用还会成对记录 `hook_started` / `hook_finished`，包含 transcript 大小、扫描字节范围、解析错误数、状态读写结果和总耗时。出现 `hook_started` 但没有对应的 `hook_finished`，通常表示 hook 超时或进程被终止。
+
 ## 为什么使用增量扫描
 
 Codex transcript 是追加写入的 JSONL。旧版本每次 prompt 都从头解析完整文件，大 session 会超过 hook 超时。现在首次通过内存映射快速定位 compact 标记，只解析最后一次 compact 之后的记录；后续只扫描上次保存的字节偏移之后的新内容。没有 compact 的 transcript 才会退回读取末尾 4 MiB。

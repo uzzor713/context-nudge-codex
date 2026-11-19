@@ -12,6 +12,7 @@ import mmap
 import os
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -47,6 +48,7 @@ def _scan_records(path, start, stats):
             try:
                 record = json.loads(raw)
             except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+                stats["parse_error_count"] += 1
                 continue
             if not isinstance(record, dict):
                 continue
@@ -142,6 +144,15 @@ def transcript_stats(path, state=None):
             "current": None,
             "window": None,
             "state": state,
+            "diagnostics": {
+                "transcript_size_bytes": None,
+                "scan_start_offset": None,
+                "scan_end_offset": None,
+                "scanned_bytes": 0,
+                "initial_marker_scan": False,
+                "parse_error_count": 0,
+                "scan_ok": False,
+            },
         }
 
     same_transcript = state.get("transcript_path") == str(path)
@@ -159,9 +170,12 @@ def transcript_stats(path, state=None):
         "top_current": state.get("top_current") if same_transcript else None,
         "item_current": state.get("item_current") if same_transcript else None,
         "window": state.get("window") if same_transcript else None,
+        "parse_error_count": 0,
     }
 
+    initial_marker_scan = False
     if not same_transcript or offset < 0 or offset > size:
+        initial_marker_scan = True
         offset = _initial_scan_start(path, size, stats)
 
     try:
@@ -173,6 +187,15 @@ def transcript_stats(path, state=None):
             "current": stats["top_current"] if stats["top_compacts"] else stats["item_current"],
             "window": stats["window"],
             "state": state,
+            "diagnostics": {
+                "transcript_size_bytes": size,
+                "scan_start_offset": offset,
+                "scan_end_offset": None,
+                "scanned_bytes": 0,
+                "initial_marker_scan": initial_marker_scan,
+                "parse_error_count": stats["parse_error_count"],
+                "scan_ok": False,
+            },
         }
 
     use_top = stats["top_compacts"] > 0
@@ -200,21 +223,37 @@ def transcript_stats(path, state=None):
         "current": stats[f"{selected}_current"],
         "window": stats["window"],
         "state": next_state,
+        "diagnostics": {
+            "transcript_size_bytes": size,
+            "scan_start_offset": actual_start,
+            "scan_end_offset": new_offset,
+            "scanned_bytes": max(0, new_offset - actual_start),
+            "initial_marker_scan": initial_marker_scan,
+            "parse_error_count": stats["parse_error_count"],
+            "scan_ok": True,
+        },
     }
 
 
 def _load_state(path):
     try:
         state = json.loads(path.read_text())
-        return state if isinstance(state, dict) else {}
+        return (state, True) if isinstance(state, dict) else ({}, False)
+    except FileNotFoundError:
+        return {}, True
     except (OSError, ValueError, TypeError):
-        return {}
+        return {}, False
 
 
 def _write_state(directory, path, state):
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path.write_text(json.dumps(state, ensure_ascii=False) + "\n")
-    path.chmod(0o600)
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory.chmod(0o700)
+        path.write_text(json.dumps(state, ensure_ascii=False) + "\n")
+        path.chmod(0o600)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
 
 
 def _append_event(directory, event):
@@ -256,6 +295,9 @@ def _usage_fields(compacts, event_compacts, transcript_compacts, floor, current,
 
 def main():
     started = time.monotonic()
+    log_dir = None
+    lifecycle = None
+    lifecycle_details = {"status": "finished"}
     try:
         event = json.load(sys.stdin)
         if not isinstance(event, dict) or event.get("hook_event_name") not in (
@@ -269,25 +311,53 @@ def main():
 
         codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
         state_dir = codex_home / "context-nudge-state"
+        log_dir = codex_home / "context-nudge-logs"
         session_hash = hashlib.sha256(session_id.encode()).hexdigest()
+        lifecycle = {
+            "invocation_id": uuid.uuid4().hex,
+            "hook_event_name": event["hook_event_name"],
+            "session_hash": session_hash,
+        }
+        _append_event(log_dir, {"event": "hook_started", **lifecycle})
         state_path = state_dir / (session_hash + ".json")
-        state = _load_state(state_path)
+        state, state_read_ok = _load_state(state_path)
+        lifecycle_details["state_read_ok"] = state_read_ok
 
         if event.get("hook_event_name") == "SessionStart":
+            state_write_ok = True
             if event.get("source") == "compact":
                 state["event_compacts"] = int(state.get("event_compacts", 0) or 0) + 1
-                _write_state(state_dir, state_path, state)
+                state_write_ok = _write_state(state_dir, state_path, state)
+            lifecycle_details["state_write_ok"] = state_write_ok
             return
 
         prompt = str(event.get("prompt") or "")
         transcript = event.get("transcript_path")
         transcript_available = False
-        stats = {"compacts": 0, "floor": None, "current": None, "window": None, "state": state}
+        diagnostics = {
+            "transcript_size_bytes": None,
+            "scan_start_offset": None,
+            "scan_end_offset": None,
+            "scanned_bytes": 0,
+            "initial_marker_scan": False,
+            "parse_error_count": 0,
+            "scan_ok": False,
+        }
+        stats = {
+            "compacts": 0,
+            "floor": None,
+            "current": None,
+            "window": None,
+            "state": state,
+            "diagnostics": diagnostics,
+        }
         if isinstance(transcript, str) and transcript.endswith(".jsonl"):
             transcript_path = Path(transcript)
             if transcript_path.is_file():
                 transcript_available = True
                 stats = transcript_stats(transcript_path, state)
+                diagnostics = stats["diagnostics"]
+        lifecycle_details.update(diagnostics)
 
         state = stats["state"]
         transcript_compacts = stats["compacts"]
@@ -302,7 +372,8 @@ def main():
         floor_percent = usage_fields["floor_percent"] or 0
         current_percent = usage_fields["current_percent"] or 0
         state.update({"compacts": compacts, "floor_tokens": floor, "current_tokens": current})
-        _write_state(state_dir, state_path, state)
+        state_write_ok = _write_state(state_dir, state_path, state)
+        lifecycle_details["state_write_ok"] = state_write_ok
 
         if not compacts:
             level = 0
@@ -317,9 +388,13 @@ def main():
         suppressed_reason = None
         if prompt.startswith("/"):
             suppressed_reason = "slash_command"
+        elif not state_read_ok or not state_write_ok:
+            suppressed_reason = "state_error"
         elif not level:
             if not transcript_available:
                 suppressed_reason = "missing_transcript"
+            elif diagnostics["parse_error_count"]:
+                suppressed_reason = "parse_error"
             elif not compacts:
                 suppressed_reason = "no_compaction"
             elif floor is None or current is None or not window:
@@ -338,8 +413,17 @@ def main():
                 "previous_reminded_level": reminded,
                 "decision": "suppressed" if suppressed_reason else "emitted",
                 "suppressed_reason": suppressed_reason,
+                "state_read_ok": state_read_ok,
+                "state_write_ok": state_write_ok,
+                **diagnostics,
                 **usage_fields,
             },
+        )
+        lifecycle_details.update(
+            {
+                "decision": "suppressed" if suppressed_reason else "emitted",
+                "suppressed_reason": suppressed_reason,
+            }
         )
         if suppressed_reason:
             return
@@ -347,7 +431,8 @@ def main():
         previous_reminded_level = reminded
         state["reminded_level"] = level
         state["last_reminder_at"] = int(time.time())
-        _write_state(state_dir, state_path, state)
+        reminder_state_write_ok = _write_state(state_dir, state_path, state)
+        lifecycle_details["state_write_ok"] = reminder_state_write_ok
 
         facts = f"本会话已压缩 {compacts} 次"
         if floor is not None and window:
@@ -361,7 +446,7 @@ def main():
         if floor_percent >= (HIGH_FLOOR_PERCENT if level == 2 else MID_FLOOR_PERCENT):
             reasons.append("floor_percent")
         _append_event(
-            codex_home / "context-nudge-logs",
+            log_dir,
             {
                 "event": "reminder_emitted",
                 "session_hash": session_hash,
@@ -371,6 +456,7 @@ def main():
                 "previous_reminded_level": previous_reminded_level,
                 "system_message_emitted": True,
                 "additional_context_emitted": True,
+                "state_write_ok": reminder_state_write_ok,
                 "hook_duration_ms": round((time.monotonic() - started) * 1000, 3),
             },
         )
@@ -388,7 +474,19 @@ def main():
         )
     except Exception:
         # Advisory hook: malformed or unavailable input must not block a prompt.
+        lifecycle_details["status"] = "error"
         return
+    finally:
+        if log_dir is not None and lifecycle is not None:
+            _append_event(
+                log_dir,
+                {
+                    "event": "hook_finished",
+                    **lifecycle,
+                    **lifecycle_details,
+                    "hook_duration_ms": round((time.monotonic() - started) * 1000, 3),
+                },
+            )
 
 
 if __name__ == "__main__":

@@ -55,6 +55,10 @@ class ContextNudgeTests(unittest.TestCase):
             self.assertEqual(result["floor"], 36786)
             self.assertEqual(result["current"], 46899)
             self.assertGreater(result["state"]["last_scan_start"], -1)
+            self.assertTrue(result["diagnostics"]["initial_marker_scan"])
+            self.assertTrue(result["diagnostics"]["scan_ok"])
+            self.assertEqual(result["diagnostics"]["parse_error_count"], 0)
+            self.assertGreater(result["diagnostics"]["scanned_bytes"], 0)
 
     def test_incremental_scan_only_reads_appended_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -101,6 +105,8 @@ class ContextNudgeTests(unittest.TestCase):
             self.assertEqual(len(log_files), 1)
             logged_events = [json.loads(line) for line in log_files[0].read_text().splitlines()]
             event_log = next(event for event in logged_events if event["event"] == "reminder_emitted")
+            started = next(event for event in logged_events if event["event"] == "hook_started")
+            finished = next(event for event in logged_events if event["event"] == "hook_finished")
             self.assertEqual(event_log["schema_version"], 1)
             self.assertEqual(event_log["event"], "reminder_emitted")
             self.assertEqual(event_log["session_hash"], MODULE.hashlib.sha256(b"test-session").hexdigest())
@@ -111,6 +117,14 @@ class ContextNudgeTests(unittest.TestCase):
             self.assertEqual(event_log["floor_percent"], 7)
             self.assertTrue(event_log["system_message_emitted"])
             self.assertTrue(event_log["additional_context_emitted"])
+            self.assertTrue(event_log["state_write_ok"])
+            self.assertEqual(started["invocation_id"], finished["invocation_id"])
+            self.assertEqual(finished["status"], "finished")
+            self.assertTrue(finished["state_read_ok"])
+            self.assertTrue(finished["state_write_ok"])
+            self.assertTrue(finished["initial_marker_scan"])
+            self.assertGreater(finished["scanned_bytes"], 0)
+            self.assertGreaterEqual(finished["hook_duration_ms"], 0)
             self.assertEqual(log_files[0].stat().st_mode & 0o777, 0o600)
             self.assertEqual(log_files[0].parent.stat().st_mode & 0o777, 0o700)
 
@@ -164,6 +178,45 @@ class ContextNudgeTests(unittest.TestCase):
                 [event["decision"] for event in evaluations],
                 ["suppressed", "suppressed", "emitted", "suppressed"],
             )
+
+    def test_hook_logs_parse_and_state_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            malformed = tmp_path / "malformed.jsonl"
+            malformed.write_text("not-json\n")
+            parse_home = tmp_path / "parse-home"
+            event = {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "diagnostic-session",
+                "prompt": "继续",
+                "transcript_path": str(malformed),
+            }
+            self.assertEqual(self.run_hook(parse_home, event), b"")
+            parse_log = next((parse_home / "context-nudge-logs").glob("events-*.jsonl"))
+            parse_events = [json.loads(line) for line in parse_log.read_text().splitlines()]
+            parse_evaluation = next(item for item in parse_events if item["event"] == "evaluation")
+            self.assertEqual(parse_evaluation["suppressed_reason"], "parse_error")
+            self.assertEqual(parse_evaluation["parse_error_count"], 1)
+
+            state_home = tmp_path / "state-home"
+            state_home.mkdir()
+            (state_home / "context-nudge-state").write_text("blocks-state-directory")
+            transcript = tmp_path / "state-error.jsonl"
+            transcript.write_text(
+                "\n".join(
+                    json.dumps(record)
+                    for record in [compacted(), token_count(10000), compacted(), token_count(20000)]
+                )
+                + "\n"
+            )
+            event["transcript_path"] = str(transcript)
+            self.assertEqual(self.run_hook(state_home, event), b"")
+            state_log = next((state_home / "context-nudge-logs").glob("events-*.jsonl"))
+            state_events = [json.loads(line) for line in state_log.read_text().splitlines()]
+            state_evaluation = next(item for item in state_events if item["event"] == "evaluation")
+            self.assertEqual(state_evaluation["suppressed_reason"], "state_error")
+            self.assertFalse(state_evaluation["state_read_ok"])
+            self.assertFalse(state_evaluation["state_write_ok"])
 
     def test_initial_scan_counts_compacts_before_tail(self):
         with tempfile.TemporaryDirectory() as tmp:
