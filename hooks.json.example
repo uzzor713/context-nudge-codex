@@ -1,0 +1,30 @@
+{
+  "description": "Remind after repeated or ineffective context compaction.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.codex/hooks/context-nudge.py\"",
+            "timeout": 5,
+            "statusMessage": "Tracking context compaction"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.codex/hooks/context-nudge.py\"",
+            "timeout": 5,
+            "additionalContextLimit": 500,
+            "statusMessage": "Checking context health"
+          }
+        ]
+      }
+    ]
+  }
+}
