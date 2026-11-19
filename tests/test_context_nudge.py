@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -299,6 +300,105 @@ class ContextNudgeTests(unittest.TestCase):
             self.assertTrue(events[0]["agent_mentioned_handoff"])
             self.assertTrue(events[0]["agent_followed_level"])
             self.assertNotIn("当前步骤已完成", log_file.read_text())
+
+    def test_stats_command_aggregates_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp) / "codex"
+            log_dir = codex_home / "context-nudge-logs"
+            events = [
+                {
+                    "event": "evaluation",
+                    "session_hash": "one",
+                    "compact_count": 1,
+                    "decision": "suppressed",
+                    "suppressed_reason": "below_threshold",
+                    "floor_percent": 10,
+                    "current_percent": 20,
+                },
+                {
+                    "event": "evaluation",
+                    "session_hash": "one",
+                    "compact_count": 2,
+                    "decision": "emitted",
+                    "suppressed_reason": None,
+                    "floor_percent": 30,
+                    "current_percent": 40,
+                },
+                {
+                    "event": "evaluation",
+                    "session_hash": "two",
+                    "compact_count": 3,
+                    "decision": "suppressed",
+                    "suppressed_reason": "already_reminded",
+                    "floor_percent": None,
+                    "current_percent": None,
+                },
+                {
+                    "event": "reminder_emitted",
+                    "session_hash": "one",
+                    "level": 1,
+                    "reason": ["compact_count", "floor_percent"],
+                },
+                {"event": "hook_started", "invocation_id": "complete", "session_hash": "one"},
+                {"event": "hook_started", "invocation_id": "missing", "session_hash": "two"},
+                {
+                    "event": "hook_finished",
+                    "invocation_id": "complete",
+                    "session_hash": "one",
+                    "hook_duration_ms": 12.5,
+                },
+                {
+                    "event": "agent_compliance",
+                    "session_hash": "one",
+                    "final_answer_observed": True,
+                    "agent_mentioned_handoff": True,
+                    "agent_followed_level": False,
+                },
+            ]
+            for event in events:
+                self.assertTrue(MODULE._append_event(log_dir, event))
+
+            output = subprocess.check_output(
+                [
+                    sys.executable,
+                    str(ROOT / "context-nudge.py"),
+                    "stats",
+                    "--codex-home",
+                    str(codex_home),
+                ]
+            )
+            stats = json.loads(output)
+            self.assertEqual(stats["sessions_observed"], 2)
+            self.assertEqual(stats["compact_total_across_sessions"], 5)
+            self.assertEqual(stats["compact_distribution"], {"2": 1, "3": 1})
+            self.assertEqual(stats["reminders_by_level"], {"1": 1})
+            self.assertEqual(stats["trigger_reasons"], {"compact_count": 1, "floor_percent": 1})
+            self.assertEqual(
+                stats["suppression_reasons"], {"already_reminded": 1, "below_threshold": 1}
+            )
+            self.assertEqual(stats["floor_percent"]["p50"], 20)
+            self.assertEqual(stats["hook_duration_ms"]["max"], 12.5)
+            self.assertEqual(stats["started_without_finished"], 1)
+            self.assertEqual(stats["agent_compliance"]["mentioned_rate"], 1.0)
+            self.assertEqual(stats["agent_compliance"]["followed_rate"], 0.0)
+
+    def test_event_logs_rotate_and_expire(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = Path(tmp) / "logs"
+            old_log = log_dir / "events-2000-01.jsonl"
+            log_dir.mkdir()
+            old_log.write_text("{}\n")
+            old_time = time.time() - (MODULE.LOG_RETENTION_DAYS + 1) * 24 * 60 * 60
+            os.utime(old_log, (old_time, old_time))
+            original_limit = MODULE.MAX_LOG_BYTES
+            MODULE.MAX_LOG_BYTES = 80
+            try:
+                self.assertTrue(MODULE._append_event(log_dir, {"event": "x", "value": "a" * 100}))
+                self.assertTrue(MODULE._append_event(log_dir, {"event": "y", "value": "b" * 100}))
+            finally:
+                MODULE.MAX_LOG_BYTES = original_limit
+            self.assertFalse(old_log.exists())
+            self.assertEqual(len(list(log_dir.glob("events-*.jsonl"))), 2)
 
 
 if __name__ == "__main__":

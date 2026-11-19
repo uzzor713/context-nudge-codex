@@ -40,6 +40,16 @@ python3 context-nudge.py analyze ~/.codex/sessions
 
 命令只识别带 Codex hook provenance 的 `[context-nudge]` developer context，再检查其后的 `final_answer` 是否提到交接、是否符合提醒档位。结果以 `agent_compliance` 事件写入日志，同一条提醒重复分析不会重复记录；回复正文和 transcript 路径不会写入日志。
 
+## 查看统计
+
+```bash
+python3 context-nudge.py stats
+```
+
+统计输出包括 session 数、compact 分布、各档提醒数、触发与抑制原因、基线/当前用量百分位、hook 耗时、只有 start 没有 finish 的调用数，以及 Agent 提及交接和按档位执行的比例。输出只含聚合值。
+
+事件日志按自然月分文件，单文件达到约 10 MiB 后继续写带序号的分片，默认保留 90 天。
+
 ## 为什么使用增量扫描
 
 Codex transcript 是追加写入的 JSONL。旧版本每次 prompt 都从头解析完整文件，大 session 会超过 hook 超时。现在首次通过内存映射快速定位 compact 标记，只解析最后一次 compact 之后的记录；后续只扫描上次保存的字节偏移之后的新内容。没有 compact 的 transcript 才会退回读取末尾 4 MiB。

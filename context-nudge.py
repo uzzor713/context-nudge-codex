@@ -12,9 +12,11 @@ import json
 import mmap
 import os
 import re
+import statistics
 import sys
 import time
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,6 +29,8 @@ MAX_INITIAL_SCAN_BYTES = 4 * 1024 * 1024
 TOP_COMPACT_MARKERS = (b'"type":"compacted"', b'"type": "compacted"')
 ITEM_COMPACT_MARKERS = (b'"type":"compaction"', b'"type": "compaction"')
 EVENT_SCHEMA_VERSION = 1
+MAX_LOG_BYTES = 10 * 1024 * 1024
+LOG_RETENTION_DAYS = 90
 HANDOFF_PATTERN = re.compile(
     r"交接|新(?:的)?(?:对话|会话)|另开(?:对话|会话)|handoff|hand off|new (?:chat|conversation|session|thread)",
     re.IGNORECASE,
@@ -266,13 +270,42 @@ def _write_state(directory, path, state):
         return False
 
 
+def _prune_logs(directory, now):
+    cutoff = now.timestamp() - LOG_RETENTION_DAYS * 24 * 60 * 60
+    try:
+        paths = list(directory.glob("events-*.jsonl"))
+    except OSError:
+        return
+    for path in paths:
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            continue
+
+
+def _event_log_path(directory, timestamp):
+    base = directory / f"events-{timestamp:%Y-%m}.jsonl"
+    path = base
+    sequence = 0
+    while True:
+        try:
+            if not path.exists() or path.stat().st_size < MAX_LOG_BYTES:
+                return path
+        except OSError:
+            return path
+        sequence += 1
+        path = directory / f"events-{timestamp:%Y-%m}.{sequence}.jsonl"
+
+
 def _append_event(directory, event):
     """Append one privacy-safe event without making the hook blocking."""
     try:
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         directory.chmod(0o700)
         timestamp = datetime.now(timezone.utc)
-        path = directory / f"events-{timestamp:%Y-%m}.jsonl"
+        _prune_logs(directory, timestamp)
+        path = _event_log_path(directory, timestamp)
         payload = dict(event)
         payload.setdefault("schema_version", EVENT_SCHEMA_VERSION)
         payload.setdefault("timestamp", timestamp.isoformat())
@@ -426,6 +459,137 @@ def _existing_compliance_keys(log_dir):
     return keys
 
 
+def _read_log_events(log_dir):
+    events = []
+    invalid_lines = 0
+    try:
+        paths = sorted(log_dir.glob("events-*.jsonl"))
+    except OSError:
+        return events, invalid_lines
+    for path in paths:
+        try:
+            stream = path.open("r", encoding="utf-8")
+        except OSError:
+            continue
+        with stream:
+            for raw in stream:
+                try:
+                    event = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+                    invalid_lines += 1
+                    continue
+                if isinstance(event, dict):
+                    events.append(event)
+                else:
+                    invalid_lines += 1
+    return events, invalid_lines
+
+
+def _numeric_summary(values):
+    numbers = sorted(value for value in values if isinstance(value, (int, float)))
+    if not numbers:
+        return {"count": 0, "p50": None, "p95": None, "max": None}
+
+    def percentile(fraction):
+        index = max(0, int((len(numbers) * fraction) + 0.999999) - 1)
+        return numbers[index]
+
+    return {
+        "count": len(numbers),
+        "p50": statistics.median(numbers),
+        "p95": percentile(0.95),
+        "max": numbers[-1],
+    }
+
+
+def build_stats(events, invalid_lines=0):
+    sessions = set()
+    reminder_levels = Counter()
+    trigger_reasons = Counter()
+    suppression_reasons = Counter()
+    session_compacts = {}
+    floor_percents = []
+    current_percents = []
+    started = set()
+    finished = set()
+    hook_durations = []
+    compliance_total = 0
+    compliance_final = 0
+    compliance_mentioned = 0
+    compliance_followed = 0
+
+    for event in events:
+        session_hash = event.get("session_hash")
+        if isinstance(session_hash, str) and session_hash:
+            sessions.add(session_hash)
+        event_name = event.get("event")
+        if event_name == "evaluation":
+            compacts = event.get("compact_count")
+            if isinstance(session_hash, str) and isinstance(compacts, int):
+                session_compacts[session_hash] = max(session_compacts.get(session_hash, 0), compacts)
+            if event.get("decision") == "suppressed" and event.get("suppressed_reason"):
+                suppression_reasons[str(event["suppressed_reason"])] += 1
+            floor_percents.append(event.get("floor_percent"))
+            current_percents.append(event.get("current_percent"))
+        elif event_name == "reminder_emitted":
+            level = event.get("level")
+            if isinstance(level, int):
+                reminder_levels[str(level)] += 1
+            reasons = event.get("reason")
+            if isinstance(reasons, list):
+                trigger_reasons.update(str(reason) for reason in reasons)
+        elif event_name == "hook_started":
+            invocation_id = event.get("invocation_id")
+            if invocation_id:
+                started.add(invocation_id)
+        elif event_name == "hook_finished":
+            invocation_id = event.get("invocation_id")
+            if invocation_id:
+                finished.add(invocation_id)
+            hook_durations.append(event.get("hook_duration_ms"))
+        elif event_name == "agent_compliance":
+            compliance_total += 1
+            compliance_final += int(event.get("final_answer_observed") is True)
+            compliance_mentioned += int(event.get("agent_mentioned_handoff") is True)
+            compliance_followed += int(event.get("agent_followed_level") is True)
+
+    compact_distribution = Counter(session_compacts.values())
+    return {
+        "events_read": len(events),
+        "invalid_log_lines": invalid_lines,
+        "sessions_observed": len(sessions),
+        "compact_total_across_sessions": sum(session_compacts.values()),
+        "compact_distribution": {
+            str(key): compact_distribution[key] for key in sorted(compact_distribution)
+        },
+        "reminders_total": sum(reminder_levels.values()),
+        "reminders_by_level": dict(sorted(reminder_levels.items())),
+        "trigger_reasons": dict(sorted(trigger_reasons.items())),
+        "suppression_reasons": dict(sorted(suppression_reasons.items())),
+        "floor_percent": _numeric_summary(floor_percents),
+        "current_percent": _numeric_summary(current_percents),
+        "hook_duration_ms": _numeric_summary(hook_durations),
+        "started_without_finished": len(started - finished),
+        "agent_compliance": {
+            "total": compliance_total,
+            "final_answer_observed": compliance_final,
+            "mentioned_handoff": compliance_mentioned,
+            "followed_level": compliance_followed,
+            "mentioned_rate": (
+                round(compliance_mentioned / compliance_total, 4) if compliance_total else None
+            ),
+            "followed_rate": (
+                round(compliance_followed / compliance_total, 4) if compliance_total else None
+            ),
+        },
+    }
+
+
+def stats_command(codex_home):
+    events, invalid_lines = _read_log_events(codex_home / "context-nudge-logs")
+    print(json.dumps(build_stats(events, invalid_lines), ensure_ascii=False, indent=2))
+
+
 def analyze_command(paths, codex_home):
     log_dir = codex_home / "context-nudge-logs"
     existing = _existing_compliance_keys(log_dir)
@@ -461,10 +625,15 @@ def cli():
     analyze = subparsers.add_parser("analyze", help="analyze Agent handling of hook reminders")
     analyze.add_argument("paths", nargs="+", type=Path, help="transcript files or directories")
     analyze.add_argument("--codex-home", type=Path)
+    stats = subparsers.add_parser("stats", help="summarize local context-nudge events")
+    stats.add_argument("--codex-home", type=Path)
     args = parser.parse_args()
     if args.command == "analyze":
         codex_home = args.codex_home or Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
         analyze_command(args.paths, codex_home)
+    elif args.command == "stats":
+        codex_home = args.codex_home or Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        stats_command(codex_home)
     else:
         main()
 
