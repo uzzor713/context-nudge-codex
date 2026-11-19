@@ -26,7 +26,7 @@ chmod +x ~/.codex/hooks/context-nudge.py
 
 状态写入 `~/.codex/context-nudge-state/`。每个 session 保存 transcript 增量扫描位置、compact 计数、基线、当前用量和最后提醒档位。
 
-提醒实际触发时会向 `~/.codex/context-nudge-logs/events-YYYY-MM.jsonl` 追加一条 `reminder_emitted` 事件，包括哈希后的 session 标识、触发原因、compact 计数、压缩后基线、当前用量和输出目标。日志不保存 prompt、回复正文、tool 输出或 transcript 路径；目录权限为 `0700`，日志文件权限为 `0600`。
+每次用户提交消息时会向 `~/.codex/context-nudge-logs/events-YYYY-MM.jsonl` 追加一条 `evaluation`，记录提醒是触发还是被抑制及其原因；实际触发时另写一条 `reminder_emitted`。日志包括哈希后的 session 标识、触发原因、compact 计数、压缩后基线、当前用量和输出目标，不保存 prompt、回复正文、tool 输出或 transcript 路径。目录权限为 `0700`，日志文件权限为 `0600`。
 
 ## 为什么使用增量扫描
 

@@ -239,6 +239,21 @@ def _append_event(directory, event):
         return False
 
 
+def _usage_fields(compacts, event_compacts, transcript_compacts, floor, current, window):
+    floor_percent = floor * 100 // window if floor is not None and window else None
+    current_percent = current * 100 // window if current is not None and window else None
+    return {
+        "compact_count": compacts,
+        "event_compact_count": event_compacts,
+        "transcript_compact_count": transcript_compacts,
+        "floor_tokens": floor,
+        "floor_percent": floor_percent,
+        "current_tokens": current,
+        "current_percent": current_percent,
+        "context_window": window,
+    }
+
+
 def main():
     started = time.monotonic()
     try:
@@ -266,10 +281,12 @@ def main():
 
         prompt = str(event.get("prompt") or "")
         transcript = event.get("transcript_path")
+        transcript_available = False
         stats = {"compacts": 0, "floor": None, "current": None, "window": None, "state": state}
         if isinstance(transcript, str) and transcript.endswith(".jsonl"):
             transcript_path = Path(transcript)
             if transcript_path.is_file():
+                transcript_available = True
                 stats = transcript_stats(transcript_path, state)
 
         state = stats["state"]
@@ -279,24 +296,54 @@ def main():
         floor = stats["floor"]
         current = stats["current"]
         window = stats["window"]
+        usage_fields = _usage_fields(
+            compacts, event_compacts, transcript_compacts, floor, current, window
+        )
+        floor_percent = usage_fields["floor_percent"] or 0
+        current_percent = usage_fields["current_percent"] or 0
         state.update({"compacts": compacts, "floor_tokens": floor, "current_tokens": current})
         _write_state(state_dir, state_path, state)
 
         if not compacts:
-            return
-        floor_percent = floor * 100 // window if floor is not None and window else 0
-        current_percent = current * 100 // window if current is not None and window else 0
-        level = 0
-        if compacts >= MID_COMPACTS or floor_percent >= MID_FLOOR_PERCENT:
-            level = 1
-        if compacts >= HIGH_COMPACTS or floor_percent >= HIGH_FLOOR_PERCENT:
-            level = 2
-        if not level or prompt.startswith("/"):
-            return
+            level = 0
+        else:
+            level = 0
+            if compacts >= MID_COMPACTS or floor_percent >= MID_FLOOR_PERCENT:
+                level = 1
+            if compacts >= HIGH_COMPACTS or floor_percent >= HIGH_FLOOR_PERCENT:
+                level = 2
 
         reminded = int(state.get("reminded_level", 0) or 0)
-        if level <= reminded:
+        suppressed_reason = None
+        if prompt.startswith("/"):
+            suppressed_reason = "slash_command"
+        elif not level:
+            if not transcript_available:
+                suppressed_reason = "missing_transcript"
+            elif not compacts:
+                suppressed_reason = "no_compaction"
+            elif floor is None or current is None or not window:
+                suppressed_reason = "missing_token_usage"
+            else:
+                suppressed_reason = "below_threshold"
+        elif level <= reminded:
+            suppressed_reason = "already_reminded"
+
+        _append_event(
+            codex_home / "context-nudge-logs",
+            {
+                "event": "evaluation",
+                "session_hash": session_hash,
+                "computed_level": level,
+                "previous_reminded_level": reminded,
+                "decision": "suppressed" if suppressed_reason else "emitted",
+                "suppressed_reason": suppressed_reason,
+                **usage_fields,
+            },
+        )
+        if suppressed_reason:
             return
+
         previous_reminded_level = reminded
         state["reminded_level"] = level
         state["last_reminder_at"] = int(time.time())
@@ -320,14 +367,7 @@ def main():
                 "session_hash": session_hash,
                 "level": level,
                 "reason": reasons,
-                "compact_count": compacts,
-                "event_compact_count": event_compacts,
-                "transcript_compact_count": transcript_compacts,
-                "floor_tokens": floor,
-                "floor_percent": floor_percent if floor is not None and window else None,
-                "current_tokens": current,
-                "current_percent": current_percent if current is not None and window else None,
-                "context_window": window,
+                **usage_fields,
                 "previous_reminded_level": previous_reminded_level,
                 "system_message_emitted": True,
                 "additional_context_emitted": True,
