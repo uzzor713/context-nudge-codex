@@ -28,7 +28,7 @@ chmod +x ~/.codex/hooks/context-nudge.py
 
 ## 为什么使用增量扫描
 
-Codex transcript 是追加写入的 JSONL。旧版本每次 prompt 都从头解析完整文件，大 session 会超过 hook 超时。现在首次最多扫描末尾 4 MiB，后续只扫描上次记录的字节偏移。
+Codex transcript 是追加写入的 JSONL。旧版本每次 prompt 都从头解析完整文件，大 session 会超过 hook 超时。现在首次通过内存映射快速定位 compact 标记，只解析最后一次 compact 之后的记录；后续只扫描上次保存的字节偏移之后的新内容。没有 compact 的 transcript 才会退回读取末尾 4 MiB。
 
 compact 后 Codex 可能先写一条 `input_tokens=0` 的 bookkeeping 记录。该记录不作为基线，首条正数 token 用量才会被采用。
 
