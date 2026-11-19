@@ -6,10 +6,12 @@ transcripts are append-only JSONL files, so rescanning the whole file on every
 prompt is both unnecessary and likely to exceed the hook timeout.
 """
 
+import argparse
 import hashlib
 import json
 import mmap
 import os
+import re
 import sys
 import time
 import uuid
@@ -25,6 +27,14 @@ MAX_INITIAL_SCAN_BYTES = 4 * 1024 * 1024
 TOP_COMPACT_MARKERS = (b'"type":"compacted"', b'"type": "compacted"')
 ITEM_COMPACT_MARKERS = (b'"type":"compaction"', b'"type": "compaction"')
 EVENT_SCHEMA_VERSION = 1
+HANDOFF_PATTERN = re.compile(
+    r"交接|新(?:的)?(?:对话|会话)|另开(?:对话|会话)|handoff|hand off|new (?:chat|conversation|session|thread)",
+    re.IGNORECASE,
+)
+URGENT_HANDOFF_PATTERN = re.compile(
+    r"尽快|马上|立即|现在|当前.{0,12}(?:完成|结束).{0,12}(?:后|就)|as soon as|immediately|right now",
+    re.IGNORECASE,
+)
 
 
 def _seek_to_record(stream, start):
@@ -293,6 +303,172 @@ def _usage_fields(compacts, event_compacts, transcript_compacts, floor, current,
     }
 
 
+def _message_text(payload):
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        item.get("text", "")
+        for item in content
+        if isinstance(item, dict) and isinstance(item.get("text"), str)
+    )
+
+
+def _hook_reminder(payload):
+    if payload.get("type") != "message" or payload.get("role") != "developer":
+        return None
+    metadata = payload.get("internal_chat_message_metadata_passthrough")
+    if not isinstance(metadata, dict):
+        return None
+    content_item_kinds = metadata.get("content_item_kinds")
+    if not isinstance(content_item_kinds, list) or "hooks.additional_context" not in content_item_kinds:
+        return None
+    item_metadata = metadata.get("content_item_metadata")
+    if not isinstance(item_metadata, list) or not any(
+        isinstance(item, dict)
+        and isinstance(item.get("provenance"), dict)
+        and item["provenance"].get("hook") is True
+        for item in item_metadata
+    ):
+        return None
+    text = _message_text(payload)
+    if not text.startswith("[context-nudge]"):
+        return None
+    return {
+        "id": str(payload.get("id") or text),
+        "level": 2 if "尽快" in text else 1,
+    }
+
+
+def _compliance_result(session_hash, pending, final_text=None):
+    mentioned = bool(final_text and HANDOFF_PATTERN.search(final_text))
+    followed = mentioned and (
+        pending["level"] == 1 or bool(URGENT_HANDOFF_PATTERN.search(final_text or ""))
+    )
+    return {
+        "event": "agent_compliance",
+        "session_hash": session_hash,
+        "reminder_hash": hashlib.sha256(pending["id"].encode()).hexdigest(),
+        "level": pending["level"],
+        "agent_context_observed": True,
+        "final_answer_observed": final_text is not None,
+        "agent_mentioned_handoff": mentioned,
+        "agent_followed_level": followed,
+    }
+
+
+def analyze_transcript(path):
+    """Return privacy-safe compliance results for hook reminders in one transcript."""
+    session_hash = None
+    pending = None
+    results = []
+    try:
+        stream = path.open("r", encoding="utf-8")
+    except OSError:
+        return results
+    with stream:
+        for raw in stream:
+            try:
+                record = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+                continue
+            if not isinstance(record, dict):
+                continue
+            payload = record.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if record.get("type") == "session_meta" and session_hash is None:
+                session_id = str(payload.get("session_id") or payload.get("id") or "")
+                if session_id:
+                    session_hash = hashlib.sha256(session_id.encode()).hexdigest()
+                continue
+            if record.get("type") != "response_item":
+                continue
+
+            reminder = _hook_reminder(payload)
+            if reminder is not None:
+                if pending is not None and session_hash is not None:
+                    results.append(_compliance_result(session_hash, pending))
+                pending = reminder
+                continue
+            if pending is None or session_hash is None or payload.get("type") != "message":
+                continue
+            if payload.get("role") == "assistant" and payload.get("phase") == "final_answer":
+                results.append(_compliance_result(session_hash, pending, _message_text(payload)))
+                pending = None
+            elif payload.get("role") == "user":
+                results.append(_compliance_result(session_hash, pending))
+                pending = None
+    if pending is not None and session_hash is not None:
+        results.append(_compliance_result(session_hash, pending))
+    return results
+
+
+def _existing_compliance_keys(log_dir):
+    keys = set()
+    try:
+        paths = sorted(log_dir.glob("events-*.jsonl"))
+    except OSError:
+        return keys
+    for path in paths:
+        try:
+            stream = path.open("r", encoding="utf-8")
+        except OSError:
+            continue
+        with stream:
+            for raw in stream:
+                try:
+                    event = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+                    continue
+                if isinstance(event, dict) and event.get("event") == "agent_compliance":
+                    keys.add((event.get("session_hash"), event.get("reminder_hash")))
+    return keys
+
+
+def analyze_command(paths, codex_home):
+    log_dir = codex_home / "context-nudge-logs"
+    existing = _existing_compliance_keys(log_dir)
+    transcript_paths = []
+    for path in paths:
+        if path.is_dir():
+            transcript_paths.extend(sorted(path.rglob("*.jsonl")))
+        elif path.is_file():
+            transcript_paths.append(path)
+
+    summary = {
+        "transcripts_scanned": len(transcript_paths),
+        "reminders_found": 0,
+        "events_written": 0,
+        "agent_mentioned_handoff": 0,
+        "agent_followed_level": 0,
+    }
+    for path in transcript_paths:
+        for result in analyze_transcript(path):
+            summary["reminders_found"] += 1
+            summary["agent_mentioned_handoff"] += int(result["agent_mentioned_handoff"])
+            summary["agent_followed_level"] += int(result["agent_followed_level"])
+            key = (result["session_hash"], result["reminder_hash"])
+            if key not in existing and _append_event(log_dir, result):
+                existing.add(key)
+                summary["events_written"] += 1
+    print(json.dumps(summary, ensure_ascii=False))
+
+
+def cli():
+    parser = argparse.ArgumentParser(description="Codex context handoff reminder")
+    subparsers = parser.add_subparsers(dest="command")
+    analyze = subparsers.add_parser("analyze", help="analyze Agent handling of hook reminders")
+    analyze.add_argument("paths", nargs="+", type=Path, help="transcript files or directories")
+    analyze.add_argument("--codex-home", type=Path)
+    args = parser.parse_args()
+    if args.command == "analyze":
+        codex_home = args.codex_home or Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        analyze_command(args.paths, codex_home)
+    else:
+        main()
+
+
 def main():
     started = time.monotonic()
     log_dir = None
@@ -490,4 +666,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    cli()

@@ -231,6 +231,75 @@ class ContextNudgeTests(unittest.TestCase):
             self.assertEqual(result["floor"], 30000)
             self.assertGreater(result["state"]["last_scan_start"], 4 * 1024 * 1024)
 
+    def test_offline_analysis_logs_agent_compliance_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            transcript = tmp_path / "analysis.jsonl"
+            records = [
+                {
+                    "type": "session_meta",
+                    "payload": {"id": "analysis-session", "session_id": "analysis-session"},
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "id": "reminder-message",
+                        "role": "developer",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "[context-nudge] 本会话已压缩 3 次。建议完成当前这一小步后尽快生成交接摘要并开新对话。",
+                            }
+                        ],
+                        "internal_chat_message_metadata_passthrough": {
+                            "content_item_kinds": ["hooks.additional_context"],
+                            "content_item_metadata": [{"provenance": {"hook": True}}],
+                        },
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "final_answer",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "当前步骤已完成。请尽快生成交接摘要并开新对话。",
+                            }
+                        ],
+                    },
+                },
+            ]
+            transcript.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+            codex_home = tmp_path / "codex"
+            command = [
+                sys.executable,
+                str(ROOT / "context-nudge.py"),
+                "analyze",
+                str(transcript),
+                "--codex-home",
+                str(codex_home),
+            ]
+            first = json.loads(subprocess.check_output(command))
+            second = json.loads(subprocess.check_output(command))
+            self.assertEqual(first["reminders_found"], 1)
+            self.assertEqual(first["events_written"], 1)
+            self.assertEqual(second["events_written"], 0)
+
+            log_file = next((codex_home / "context-nudge-logs").glob("events-*.jsonl"))
+            events = [json.loads(line) for line in log_file.read_text().splitlines()]
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["event"], "agent_compliance")
+            self.assertEqual(events[0]["level"], 2)
+            self.assertTrue(events[0]["agent_context_observed"])
+            self.assertTrue(events[0]["final_answer_observed"])
+            self.assertTrue(events[0]["agent_mentioned_handoff"])
+            self.assertTrue(events[0]["agent_followed_level"])
+            self.assertNotIn("当前步骤已完成", log_file.read_text())
+
 
 if __name__ == "__main__":
     unittest.main()

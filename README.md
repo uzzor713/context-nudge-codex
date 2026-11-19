@@ -30,6 +30,16 @@ chmod +x ~/.codex/hooks/context-nudge.py
 
 每次 hook 调用还会成对记录 `hook_started` / `hook_finished`，包含 transcript 大小、扫描字节范围、解析错误数、状态读写结果和总耗时。出现 `hook_started` 但没有对应的 `hook_finished`，通常表示 hook 超时或进程被终止。
 
+## 离线检查 Agent 是否执行提醒
+
+同步 hook 不分析 Agent 回复。需要检查时，离线扫描单个 transcript 或 sessions 目录：
+
+```bash
+python3 context-nudge.py analyze ~/.codex/sessions
+```
+
+命令只识别带 Codex hook provenance 的 `[context-nudge]` developer context，再检查其后的 `final_answer` 是否提到交接、是否符合提醒档位。结果以 `agent_compliance` 事件写入日志，同一条提醒重复分析不会重复记录；回复正文和 transcript 路径不会写入日志。
+
 ## 为什么使用增量扫描
 
 Codex transcript 是追加写入的 JSONL。旧版本每次 prompt 都从头解析完整文件，大 session 会超过 hook 超时。现在首次通过内存映射快速定位 compact 标记，只解析最后一次 compact 之后的记录；后续只扫描上次保存的字节偏移之后的新内容。没有 compact 的 transcript 才会退回读取末尾 4 MiB。
